@@ -1,0 +1,189 @@
+import os
+import numpy as np
+from base import Model, Problem
+from more_wild import get_problem_as_residual_vector
+from wrapper_base import Experiment, problem_directory
+from solvers.astrodfrf import ASTRODFRF
+from plotting import create_plots
+
+
+# Define MoreWildModel
+class MoreWildModel(Model):
+    def __init__(self, fixed_factors=None):
+        if fixed_factors is None:
+            fixed_factors = {}
+        # Get More Wild problem information
+        self.probnum = fixed_factors["probnum"]
+        resid_objfun, x0, n, m = get_problem_as_residual_vector(self.probnum)
+        self.resid_objfun = resid_objfun
+        self.x0 = x0
+        self.dim = n
+
+        # Define attributes
+        self.name = f"MW{self.probnum}"  # e.g., MW1, MW2, ...
+        self.n_rngs = 1
+        self.n_responses = 1
+        self.factors = fixed_factors
+        self.specifications = {
+            "x": {
+                "description": "point to evaluate",
+                "datatype": tuple,
+                "default": tuple(self.x0)
+            }
+        }
+        self.check_factor_list = {
+            "x": self.check_x
+        }
+        super().__init__(fixed_factors)
+
+    def check_x(self):
+        """
+        Check if x is a valid input point.
+        """
+        return isinstance(self.factors["x"], tuple) and len(self.factors["x"]) == self.dim
+
+    def replicate(self, rng_list):
+        """
+        Use random number generators to compute the objective function value.
+        """
+        noise_rng = rng_list[0]
+        x = np.array(self.factors["x"])
+        fvec = self.resid_objfun(x)  # Residual vector
+        fn_eval = np.dot(fvec, fvec) + noise_rng.normalvariate(0, 1)  # Add noise
+        return {"est_f(x)": fn_eval}, {}
+
+
+# Define MoreWildProblem
+class MoreWildProblem(Problem):
+    def __init__(self, name="MW1", fixed_factors=None, model_fixed_factors=None):
+        if fixed_factors is None:
+            fixed_factors = {}
+        if model_fixed_factors is None:
+            model_fixed_factors = {}
+        self.name = name  # e.g., MW1, MW2, ...
+        self.n_objectives = 1
+        self.n_stochastic_constraints = 0
+        self.minmax = (-1,)
+        self.constraint_type = "unconstrained"
+        self.variable_type = "continuous"
+        self.gradient_available = False
+        self.model_default_factors = {}
+        self.model_fixed_factors = model_fixed_factors
+        self.model_decision_factors = {"x"}
+        self.factors = fixed_factors
+        self.specifications = {
+            "initial_solution": {
+                "description": "initial solution",
+                "datatype": tuple,
+                "default": tuple(fixed_factors.get("x0", (0.0,)))
+            },
+            "budget": {
+                "description": "max # of replications for a solver to take",
+                "datatype": int,
+                "default": 1000
+            }
+        }
+        self.check_factor_list = {
+            "initial_solution": self.check_initial_solution,
+            "budget": self.check_budget
+        }
+        super().__init__(fixed_factors, model_fixed_factors)
+        self.dim = len(self.factors["initial_solution"])
+        self.lower_bounds = (-np.inf,) * self.dim
+        self.upper_bounds = (np.inf,) * self.dim
+        # Associate the model
+        self.model = MoreWildModel(fixed_factors=model_fixed_factors)
+
+
+# Register MoreWildProblem to problem_directory
+problem_directory["MW1"] = lambda fixed_factors=None, model_fixed_factors=None: MoreWildProblem(
+    name="MW1", fixed_factors=fixed_factors, model_fixed_factors=model_fixed_factors
+)
+
+
+# Function to run a single experiment
+def run_single_experiment(solver, problem, budget):
+    # Explicitly initialize dummy_solns
+    if not hasattr(solver, "dummy_solns") or solver.dummy_solns is None:
+        solver.dummy_solns = [[0.0] * problem.dim]  # Default initialization as all-zero solution
+
+    experiment = Experiment(
+        solver_name=solver.name,
+        problem_name=problem.name,  # Use problem's name
+        solver_fixed_factors={"budget": budget},
+        problem_fixed_factors={},
+        model_fixed_factors={"probnum": problem.model.probnum}
+    )
+    experiment.run(n_macroreps=1)
+    return experiment
+
+
+# Function to run multiple experiments
+def run_multiple_experiments(probnums, n_runs, budget, noise_type='smooth'):
+    all_experiments = []
+    solver = ASTRODFRF(fixed_factors={"budget": budget})
+
+    for probnum in probnums:
+        print(f"Running experiments for problem MW{probnum}")
+        model = MoreWildModel(fixed_factors={"probnum": probnum})
+        problem = MoreWildProblem(
+            name=f"MW{probnum}",
+            fixed_factors={"x0": model.x0, "budget": budget},
+            model_fixed_factors={"probnum": probnum}
+        )
+
+        # Dynamically register each problem
+        problem_directory[f"MW{probnum}"] = lambda fixed_factors=None, model_fixed_factors=None: MoreWildProblem(
+            name=f"MW{probnum}", fixed_factors=fixed_factors, model_fixed_factors=model_fixed_factors
+        )
+
+        for run in range(n_runs):
+            print(f"  Run {run + 1}/{n_runs}")
+            experiment = run_single_experiment(solver, problem, budget)
+            all_experiments.append(experiment)
+
+    return all_experiments
+
+
+# Save experiment results
+def save_experiment_results(experiments, output_dir="results"):
+    os.makedirs(output_dir, exist_ok=True)
+
+    for experiment in experiments:
+        file_name = f"{experiment.solver.name}_on_{experiment.problem.name}.pickle"
+        file_path = os.path.join(output_dir, file_name)
+        experiment.record_experiment_results(file_path)
+
+
+# Generate performance profiles
+def generate_performance_profiles(results_dir, problem_info_file, tau_levels=range(1, 11), budget=1000):
+    solver_info = [
+        (os.path.join(results_dir, "ASTRODFSolver"), "ASTRO-DF", "blue", "-")
+    ]
+
+    create_plots(
+        outfile_stem="performance_profiles",
+        solver_info=solver_info,
+        tau_levels=tau_levels,
+        budget=budget,
+        save_to_file=True,
+        fmt="png"
+    )
+
+
+# Main program
+if __name__ == "__main__":
+    # Set parameters
+    problem_numbers = list(range(1, 54))  # 53 More & Wild problems
+    n_runs = 10  # Run each problem 10 times
+    budget = 1000  # Evaluation budget
+    noise_type = "smooth"  # Type of noise
+    results_dir = "results"  # Directory to save results
+    problem_info_file = "more_wild_info.csv"  # Problem information file
+
+    # Run experiments
+    experiments = run_multiple_experiments(problem_numbers, n_runs, budget, noise_type)
+    save_experiment_results(experiments, results_dir)
+
+    # Generate performance profiles
+    generate_performance_profiles(results_dir, problem_info_file)
