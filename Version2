@@ -1,0 +1,189 @@
+import os
+import numpy as np
+from base import Model, Problem
+from more_wild import get_problem_as_residual_vector
+from wrapper_base import Experiment, problem_directory
+from solvers.astrodfrf import ASTRODFRF
+from plotting import create_plots
+
+
+# 定义 MoreWildModel
+class MoreWildModel(Model):
+    def __init__(self, fixed_factors=None):
+        if fixed_factors is None:
+            fixed_factors = {}
+        # 获取 More Wild 问题信息
+        self.probnum = fixed_factors["probnum"]
+        resid_objfun, x0, n, m = get_problem_as_residual_vector(self.probnum)
+        self.resid_objfun = resid_objfun
+        self.x0 = x0
+        self.dim = n
+
+        # 定义属性
+        self.name = f"MW{self.probnum}"  # e.g., MW1, MW2, ...
+        self.n_rngs = 1
+        self.n_responses = 1
+        self.factors = fixed_factors
+        self.specifications = {
+            "x": {
+                "description": "point to evaluate",
+                "datatype": tuple,
+                "default": tuple(self.x0)
+            }
+        }
+        self.check_factor_list = {
+            "x": self.check_x
+        }
+        super().__init__(fixed_factors)
+
+    def check_x(self):
+        """
+        检查 x 是否为有效的输入点。
+        """
+        return isinstance(self.factors["x"], tuple) and len(self.factors["x"]) == self.dim
+
+    def replicate(self, rng_list):
+        """
+        使用随机数生成器计算目标函数值
+        """
+        noise_rng = rng_list[0]
+        x = np.array(self.factors["x"])
+        fvec = self.resid_objfun(x)  # 残差向量
+        fn_eval = np.dot(fvec, fvec) + noise_rng.normalvariate(0, 1)  # 加入噪声
+        return {"est_f(x)": fn_eval}, {}
+
+
+# 定义 MoreWildProblem
+class MoreWildProblem(Problem):
+    def __init__(self, name="MW1", fixed_factors=None, model_fixed_factors=None):
+        if fixed_factors is None:
+            fixed_factors = {}
+        if model_fixed_factors is None:
+            model_fixed_factors = {}
+        self.name = name  # e.g., MW1, MW2, ...
+        self.n_objectives = 1
+        self.n_stochastic_constraints = 0
+        self.minmax = (-1,)
+        self.constraint_type = "unconstrained"
+        self.variable_type = "continuous"
+        self.gradient_available = False
+        self.model_default_factors = {}
+        self.model_fixed_factors = model_fixed_factors
+        self.model_decision_factors = {"x"}
+        self.factors = fixed_factors
+        self.specifications = {
+            "initial_solution": {
+                "description": "initial solution",
+                "datatype": tuple,
+                "default": tuple(fixed_factors.get("x0", (0.0,)))
+            },
+            "budget": {
+                "description": "max # of replications for a solver to take",
+                "datatype": int,
+                "default": 1000
+            }
+        }
+        self.check_factor_list = {
+            "initial_solution": self.check_initial_solution,
+            "budget": self.check_budget
+        }
+        super().__init__(fixed_factors, model_fixed_factors)
+        self.dim = len(self.factors["initial_solution"])
+        self.lower_bounds = (-np.inf,) * self.dim
+        self.upper_bounds = (np.inf,) * self.dim
+        # 关联模型
+        self.model = MoreWildModel(fixed_factors=model_fixed_factors)
+
+
+# 注册 MoreWildProblem 到 problem_directory
+problem_directory["MW1"] = lambda fixed_factors=None, model_fixed_factors=None: MoreWildProblem(
+    name="MW1", fixed_factors=fixed_factors, model_fixed_factors=model_fixed_factors
+)
+
+
+# 单个实验的运行函数
+def run_single_experiment(solver, problem, budget):
+    # 显式初始化 dummy_solns
+    if not hasattr(solver, "dummy_solns") or solver.dummy_solns is None:
+        solver.dummy_solns = [[0.0] * problem.dim]  # 默认初始化为全零解
+
+    experiment = Experiment(
+        solver_name=solver.name,
+        problem_name=problem.name,  # 使用 problem 的名称
+        solver_fixed_factors={"budget": budget},
+        problem_fixed_factors={},
+        model_fixed_factors={"probnum": problem.model.probnum}
+    )
+    experiment.run(n_macroreps=1)
+    return experiment
+
+
+# 多次运行实验
+def run_multiple_experiments(probnums, n_runs, budget, noise_type='smooth'):
+    all_experiments = []
+    solver = ASTRODFRF(fixed_factors={"budget": budget})
+
+    for probnum in probnums:
+        print(f"Running experiments for problem MW{probnum}")
+        model = MoreWildModel(fixed_factors={"probnum": probnum})
+        problem = MoreWildProblem(
+            name=f"MW{probnum}",
+            fixed_factors={"x0": model.x0, "budget": budget},
+            model_fixed_factors={"probnum": probnum}
+        )
+
+        # 动态注册每个问题
+        problem_directory[f"MW{probnum}"] = lambda fixed_factors=None, model_fixed_factors=None: MoreWildProblem(
+            name=f"MW{probnum}", fixed_factors=fixed_factors, model_fixed_factors=model_fixed_factors
+        )
+
+        for run in range(n_runs):
+            print(f"  Run {run + 1}/{n_runs}")
+            experiment = run_single_experiment(solver, problem, budget)
+            all_experiments.append(experiment)
+
+    return all_experiments
+
+
+# 保存实验结果
+def save_experiment_results(experiments, output_dir="results"):
+    os.makedirs(output_dir, exist_ok=True)
+
+    for experiment in experiments:
+        file_name = f"{experiment.solver.name}_on_{experiment.problem.name}.pickle"
+        file_path = os.path.join(output_dir, file_name)
+        experiment.record_experiment_results(file_path)
+
+
+# 生成性能剖面图
+def generate_performance_profiles(results_dir, problem_info_file, tau_levels=range(1, 11), budget=1000):
+    solver_info = [
+        (os.path.join(results_dir, "ASTRODFSolver"), "ASTRO-DF", "blue", "-")
+    ]
+
+    create_plots(
+        outfile_stem="performance_profiles",
+        solver_info=solver_info,
+        tau_levels=tau_levels,
+        budget=budget,
+        save_to_file=True,
+        fmt="png"
+    )
+
+
+# 主程序
+if __name__ == "__main__":
+    # 设置参数
+    problem_numbers = list(range(1, 54))  # More & Wild 的 53 个问题
+    n_runs = 10  # 每个问题运行 10 次
+    budget = 1000  # 评估预算
+    noise_type = "smooth"  # 噪声类型
+    results_dir = "results"  # 保存结果的目录
+    problem_info_file = "more_wild_info.csv"  # 问题信息文件
+
+    # 运行实验
+    experiments = run_multiple_experiments(problem_numbers, n_runs, budget, noise_type)
+    save_experiment_results(experiments, results_dir)
+
+    # 生成性能剖面图
+    generate_performance_profiles(results_dir, problem_info_file)
