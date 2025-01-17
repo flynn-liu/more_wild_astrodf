@@ -1,0 +1,230 @@
+import os
+import numpy as np
+from more_wild import get_problem_as_residual_vector
+from base import Problem, Model
+from wrapper_base import Experiment
+from wrapper_base import problem_directory  # Import problem directory
+from solvers.astrodfrf import ASTRODFRF
+from plotting import create_plots
+
+
+class MoreWildProblem(Problem):
+    def __init__(self, name="MoreWild", fixed_factors=None, model_fixed_factors=None):
+        if fixed_factors is None:
+            fixed_factors = {}
+        if model_fixed_factors is None:
+            model_fixed_factors = {}
+        self.name = name
+        self.n_objectives = 1
+        self.n_stochastic_constraints = 0
+        self.minmax = (-1,)
+        self.constraint_type = "unconstrained"
+        self.variable_type = "continuous"
+        self.gradient_available = False
+        self.model_default_factors = {}
+        self.model_fixed_factors = model_fixed_factors
+        self.model_decision_factors = {"x"}
+        _, x0, _, _ = get_problem_as_residual_vector(model_fixed_factors["probnum"])  # get starting point
+
+        self.specifications = {
+            "initial_solution": {
+                "description": "initial solution",
+                "datatype": tuple,
+                "default": tuple([float(x) for x in x0])  # np.float64 --> float (prints more nicely)
+            },
+            "budget": {
+                "description": "max # of replications for a solver to take",
+                "datatype": int,
+                "default": 1000
+                # TODO multiply by (len(x0)+1) to set budget in units of simplex gradients (more common in DFO)
+            }
+        }
+        self.check_factor_list = {
+            "initial_solution": self.check_initial_solution,
+            "budget": self.check_budget
+        }
+        super().__init__(fixed_factors, model_fixed_factors)
+        self.dim = len(self.factors["initial_solution"])
+        self.lower_bounds = (-np.inf,) * self.dim
+        self.upper_bounds = (np.inf,) * self.dim
+        self.model = MoreWildModel(
+            probnum=model_fixed_factors["probnum"],
+            noise_type=model_fixed_factors["noise_type"],
+            noise_level=model_fixed_factors["noise_level"]
+        )
+
+    def vector_to_factor_dict(self, vector):
+        # Based on https://github.com/sshashaa/astro-df/blob/main/models/rosenbrock.py
+        factor_dict = {
+            "x": vector[:]
+        }
+        return factor_dict
+
+    def factor_dict_to_vector(self, factor_dict):
+        # Based on https://github.com/sshashaa/astro-df/blob/main/models/rosenbrock.py
+        vector = tuple(factor_dict["x"])
+        return vector
+
+    def response_dict_to_objectives(self, response_dict):
+        # Based on https://github.com/sshashaa/astro-df/blob/main/models/rosenbrock.py
+        objectives = (response_dict["est_f(x)"],)
+        return objectives
+
+    def response_dict_to_stoch_constraints(self, response_dict):
+        # Based on https://github.com/sshashaa/astro-df/blob/main/models/rosenbrock.py
+        stoch_constraints = None
+        return stoch_constraints
+
+    def deterministic_objectives_and_gradients(self, x):
+        # Based on https://github.com/sshashaa/astro-df/blob/main/models/rosenbrock.py
+        det_objectives = (0,)
+        det_objectives_gradients = ((0,) * self.dim,)
+        return det_objectives, det_objectives_gradients
+
+    def deterministic_stochastic_constraints_and_gradients(self, x):
+        # Based on https://github.com/sshashaa/astro-df/blob/main/models/rosenbrock.py
+        det_stoch_constraints = None
+        det_stoch_constraints_gradients = None
+        return det_stoch_constraints, det_stoch_constraints_gradients
+
+    def check_deterministic_constraints(self, x):
+        # Based on https://github.com/sshashaa/astro-df/blob/main/models/rosenbrock.py
+        # Superclass method will check box constraints.
+        # Can add other constraints here.
+        return super().check_deterministic_constraints(x)
+
+    def get_random_solution(self, rand_sol_rng):
+        # Generate a random starting point
+        # Based on https://github.com/sshashaa/astro-df/blob/main/models/rosenbrock.py
+        x = tuple(rand_sol_rng.mvnormalvariate(mean_vec=np.zeros(self.dim), cov=np.eye(self.dim), factorized=False))
+        return x
+
+
+# Define the problem class
+class MoreWildModel(Model):
+    def __init__(self, probnum, noise_type='smooth', noise_level=1e-2):
+        # Store parameters a dict object
+        fixed_factors = {"probnum": probnum, "noise_type": noise_type, "noise_level": noise_level}
+
+        # Load More & Wild function information and save
+        # NOTE: don't use noise model implemented in more_wild.py, use custom noise model implemented in replicate()
+        _, _, n, _ = get_problem_as_residual_vector(probnum)
+        self.probnum = probnum
+
+        # Define the specifications attribute
+        self.specifications = {
+            "probnum": {
+                "description": "problem number for More & Wild problem",
+                "datatype": int,
+                "default": 1
+            },
+            "noise_type": {
+                "description": "type of noise (e.g., smooth, Gaussian)",
+                "datatype": str,
+                "default": "smooth"
+            },
+            "noise_level": {
+                "description": "level of noise in the problem",
+                "datatype": float,
+                "default": 1e-2
+            }
+        }
+
+        # Call the parent class constructor
+        super().__init__(fixed_factors=fixed_factors)
+        self.name = f"MW{probnum}"  # Add name attribute
+        self.dim = n
+        self.n_rngs = 1  # Define the number of random number generators
+        self.n_responses = 1  # evaluate() has 1 output
+
+    def replicate(self, rng_list):
+        # Dynamically get residual function
+        resid_objfun, _, _, _ = get_problem_as_residual_vector(self.probnum)
+
+        # Designate random number generator for stochastic noise.
+        noise_rng = rng_list[0]
+        x = np.array(self.factors["x"])
+        fvec = resid_objfun(x)
+        fx = np.dot(fvec, fvec)
+
+        if self.factors["noise_type"] == 'smooth':
+            return {"est_f(x)": fx}, {}
+        else:
+            raise ValueError("Unknown noise type: %s" % self.factors["noise_type"])
+
+
+# Run a single experiment
+def run_single_experiment(solver, probnum, budget, n_runs, noise_type='smooth', noise_level=1e-2):
+    # Create the experiment
+    experiment = Experiment(
+        solver_name=solver.name,
+        problem_name="MoreWild",
+        solver_fixed_factors={},
+        problem_fixed_factors={"budget": budget},
+        model_fixed_factors={"probnum": probnum, "noise_type": noise_type, "noise_level": noise_level}
+    )
+
+    # Run the experiment
+    experiment.run(n_macroreps=n_runs)
+    return experiment
+
+
+# Run multiple experiments
+def run_multiple_experiments(probnums, n_runs, budget, noise_type='smooth', noise_level=1e-2):
+    all_experiments = []
+    solver = ASTRODFRF(fixed_factors={"budget": budget})
+
+    for probnum in probnums:
+        print(f"Running experiments for problem MW{probnum}")
+        experiment = run_single_experiment(solver, probnum, budget, n_runs, noise_type=noise_type,
+                                           noise_level=noise_level)
+        all_experiments.append(experiment)
+
+    return all_experiments
+
+
+# Save experiment results
+def save_experiment_results(experiments, output_dir="results"):
+    os.makedirs(output_dir, exist_ok=True)
+
+    for experiment in experiments:
+        file_name = f"{experiment.solver.name}_on_{experiment.problem.name}.pickle"
+        file_path = os.path.join(output_dir, file_name)
+        experiment.record_experiment_results(file_path)
+
+
+# Generate performance profiles
+def generate_performance_profiles(results_dir, problem_info_file, tau_levels=range(1, 11), budget=1000):
+    solver_info = [
+        (os.path.join(results_dir, "ASTRODFSolver"), "ASTRO-DF", "blue", "-")
+    ]
+
+    create_plots(
+        outfile_stem="performance_profiles",
+        solver_info=solver_info,
+        tau_levels=tau_levels,
+        budget=budget,
+        save_to_file=True,
+        fmt="png"
+    )
+
+
+# Register the problem
+problem_directory["MoreWild"] = MoreWildProblem
+
+# Main program
+if __name__ == "__main__":
+    # Set parameters
+    problem_numbers = list(range(1, 54))  # 53 More & Wild problems
+    n_runs = 10  # Run each problem 10 times
+    budget = 1000  # Evaluation budget
+    noise_type = "smooth"  # Noise type: smooth or additive_gaussian
+    results_dir = "results"  # Directory to save results
+    problem_info_file = "more_wild_info.csv"  # Problem information file
+
+    # Run experiments
+    experiments = run_multiple_experiments(problem_numbers, n_runs, budget, noise_type)
+    save_experiment_results(experiments, results_dir)
+
+    # Generate performance profiles
+    generate_performance_profiles(results_dir, problem_info_file)
